@@ -35,6 +35,27 @@ for (const [name, factoryName] of Object.entries(factories)) {
   );
 }
 
+// Pi publishes both the wrapped tools and their underlying definitions.
+// Extensions using the public create*ToolDefinition names must receive Pi's
+// definition API from PiG's generated runtime shim too.
+const definitionFactories = {
+  bash: "createBashToolDefinition",
+  edit: "createEditToolDefinition",
+  find: "createFindToolDefinition",
+  grep: "createGrepToolDefinition",
+  ls: "createLsToolDefinition",
+  read: "createReadToolDefinition",
+  write: "createWriteToolDefinition",
+};
+for (const [name, factoryName] of Object.entries(definitionFactories)) {
+  assert.equal(typeof shim[factoryName], "function", `${factoryName} export`);
+  assert.deepEqual(
+    JSON.parse(JSON.stringify(shim[factoryName]("/workspace").parameters)),
+    JSON.parse(JSON.stringify(toolModules[name][factoryName]("/workspace").parameters)),
+    `${factoryName} parameters`,
+  );
+}
+
 async function compareResult(factoryName, moduleName, options, input) {
   const actual = await shim[factoryName]("/workspace", options.actual).execute("call", input);
   const expected = await toolModules[moduleName][factoryName]("/workspace", options.expected).execute("call", input);
@@ -116,6 +137,12 @@ function bashOperations() {
   };
 }
 await compareResult("createBashTool", "bash", { actual: { operations: bashOperations() }, expected: { operations: bashOperations() } }, { command: "ignored" });
+await compareResult(
+  "createBashToolDefinition",
+  "bash",
+  { actual: { operations: bashOperations() }, expected: { operations: bashOperations() } },
+  { command: "ignored" },
+);
 
 const largeChunk = Buffer.alloc(8192, "x");
 let updateCount = 0;
