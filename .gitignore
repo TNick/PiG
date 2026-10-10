@@ -113,6 +113,9 @@ auth.json
 
 /pig
 .gopi/
+/.pi/
+/.serena/
+/playground/
 
 # Runtime session traces written into testdata dirs during parity runs.
 # Parity runner snapshots testdata to ephemeral temp dirs before launch,
