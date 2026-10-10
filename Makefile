@@ -39,6 +39,7 @@ export GOFLAGS := $(strip $(filter-out -mod=mod,$(GOFLAGS)))
 endif
 
 PIG_BIN ?= $(HOME)/.local/bin/pig
+PIG_CHECKOUT_BIN ?= $(CURDIR)/bin/pig
 # Gate-only pig binary. It is built through go.work to exercise the developing SDK, then runs with GOWORK=off so the extensions it validates build as standalone modules. module-publication separately verifies the published dependency pins.
 CHECK_PIG_BIN := $(CURDIR)/tmp/check-bin/pig
 
@@ -136,13 +137,16 @@ node-runtime: ## Regenerate the embedded Node runtime archive and content digest
 build: node-runtime ## Compile every package (go build ./...)
 	go build -buildvcs=false ./...
 
-# install: build pig binary → ~/.local/bin/pig (or PIG_BIN override)
+# install: deploy one stripped pig binary to the checkout and PIG_BIN
 # with embedded git sha + macOS ad-hoc codesign.
-install: node-runtime ## Install a stripped pig to PIG_BIN (default ~/.local/bin/pig)
-	@mkdir -p $(dir $(PIG_BIN))
-	CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags "-s -w -X main.Build=$$(git rev-parse --short HEAD 2>/dev/null || echo dev)" -o $(PIG_BIN) ./cmd/pig
-	@[ "$$(uname -s)" = "Darwin" ] && command -v codesign >/dev/null 2>&1 && codesign --force --sign - $(PIG_BIN) >/dev/null 2>&1 || true
-	@echo "installed: $$($(PIG_BIN) --version) → $(PIG_BIN)"
+install: node-runtime ## Deploy one stripped pig to bin/pig and PIG_BIN (default ~/.local/bin/pig)
+	@mkdir -p $(dir $(PIG_CHECKOUT_BIN)) $(dir $(PIG_BIN))
+	CGO_ENABLED=0 go build -buildvcs=false -trimpath -ldflags "-s -w -X main.Build=$$(git rev-parse --short HEAD 2>/dev/null || echo dev)" -o $(PIG_CHECKOUT_BIN) ./cmd/pig
+	@if [ "$(abspath $(PIG_CHECKOUT_BIN))" != "$(abspath $(PIG_BIN))" ]; then cp $(PIG_CHECKOUT_BIN) $(PIG_BIN); fi
+	@for binary in "$(PIG_CHECKOUT_BIN)" "$(PIG_BIN)"; do \
+		[ "$$(uname -s)" = "Darwin" ] && command -v codesign >/dev/null 2>&1 && codesign --force --sign - "$$binary" >/dev/null 2>&1 || true; \
+		echo "deployed: $$($$binary --version) → $$binary"; \
+	done
 
 ##@ Generated files
 

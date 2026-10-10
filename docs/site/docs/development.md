@@ -35,6 +35,8 @@ go build -o bin/pig ./cmd/pig
 
 Do not use `go install ./cmd/pig` in a development checkout. Keep test and candidate binaries under the repository `bin/` directory or another explicit temporary path.
 
+Run `make install` to deploy one stripped build to both `bin/pig` (used by the local `pigmine` launcher) and `~/.local/bin/pig`. Set `PIG_BIN=/path/to/pig` to choose the second destination; the checkout copy remains `bin/pig`.
+
 After editing `coding/extension/host/subprocess/runtime-node/`, run `go generate ./coding/extension/host/subprocess` before a direct `go build`. Commit both `runtime-node.zip` and `runtime_node_digest_generated.go` with the source changes. The archive contains the same runtime files; its generated content digest keys the immutable runtime cache. `make pig`, `make build`, `make install`, and `make parity-bin` regenerate it automatically. `TestNodeRuntimeArchiveMatchesSources` rejects added, removed, or changed source files that are missing from the archive.
 
 ## Release version
