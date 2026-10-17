@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/MichaelKinsy/PiG/coding/extension"
+	"github.com/MichaelKinsy/PiG/coding/extension/host/inproc"
 	"github.com/MichaelKinsy/PiG/internal/testbudget"
 )
 
@@ -325,7 +326,10 @@ func TestMissingPongFailsPendingWorkAsExtensionUnresponsive(t *testing.T) {
 	clock := newManualLivenessClock()
 	host, peer := net.Pipe()
 	defer func() { _ = peer.Close() }()
-	conn := newConnWithOptions("silent", host, connOptions{Clock: clock, HeartbeatInterval: 10 * time.Second, HeartbeatTimeout: 3 * time.Second})
+	conn := newConnWithOptions("silent", host, connOptions{
+		Clock: clock, HeartbeatInterval: 10 * time.Second, HeartbeatTimeout: 3 * time.Second,
+		ExtensionPath: "/ext/silent/index.ts", RegistrationOrder: 10,
+	})
 	conn.Start(t.Context())
 	result := startLivenessRequest(t, conn)
 	request := readLivenessEnvelope(t, peer)
@@ -342,6 +346,24 @@ func TestMissingPongFailsPendingWorkAsExtensionUnresponsive(t *testing.T) {
 	var unresponsive *ExtensionUnresponsiveError
 	if !errors.As(err, &unresponsive) || unresponsive.Extension != "silent" || unresponsive.RequestID == "" || unresponsive.Operation != "tool_call slow" {
 		t.Fatalf("error = %T %v", err, err)
+	}
+	var terminal *ExtensionUnresponsiveError
+	if !errors.As(conn.failureError(), &terminal) || terminal.RequestID != unresponsive.RequestID || terminal.Operation != unresponsive.Operation || terminal.OutstandingCount != 1 || terminal.OutstandingFor != 13*time.Second {
+		t.Fatalf("terminal failure = %v; want request %q (%s) after 13s with one outstanding request", conn.failureError(), unresponsive.RequestID, unresponsive.Operation)
+	}
+	message := terminal.Error()
+	if !strings.Contains(message, unresponsive.RequestID) || !strings.Contains(message, unresponsive.Operation) || !strings.Contains(message, "13s") || !strings.Contains(message, "1 request(s)") {
+		t.Fatalf("terminal failure message = %q; want request, operation, elapsed time, and count", message)
+	}
+	if !strings.Contains(message, "/ext/silent/index.ts") || !strings.Contains(message, "registration_order=10") {
+		t.Fatalf("terminal failure message = %q; want source path and registration order", message)
+	}
+	conn.pendingMu.Lock()
+	pendingCount := len(conn.pending)
+	infoCount := len(conn.pendingInfo)
+	conn.pendingMu.Unlock()
+	if pendingCount != 0 || infoCount != 0 {
+		t.Fatalf("pending requests after heartbeat failure = %d channels, %d metadata entries", pendingCount, infoCount)
 	}
 	select {
 	case <-conn.Done():
@@ -735,6 +757,7 @@ func TestPackedMemberHeartbeatFailureDisablesOnlyLogicalMember(t *testing.T) {
 	memberB := withConn(&managedExt{config: ExtConfig{Name: "member-b"}, host: host, packedCellKey: "cell-live"}, connB)
 	host.exts["member-a"] = memberA
 	host.exts["member-b"] = memberB
+	eventHandler := memberA.makeEventHandler("tool_call", 0)
 	go host.handleIncoming(memberA, memberA.connection())
 	result := startLivenessRequest(t, connA)
 	request := readLivenessEnvelope(t, peerA)
@@ -765,6 +788,28 @@ func TestPackedMemberHeartbeatFailureDisablesOnlyLogicalMember(t *testing.T) {
 	}
 	if connB.closed.Load() || host.QuarantinedCells()["cell-live"] != "" {
 		t.Fatal("logical heartbeat failure killed sibling or quarantined shared process")
+	}
+	if result, err := eventHandler(extension.BashToolCallEvent{}, t.Context()); err != nil || result != nil {
+		t.Fatalf("detached event handler = %v, %v; want nil, nil", result, err)
+	}
+}
+
+func TestEventHandlerIgnoresHeartbeatFailure(t *testing.T) {
+	hostConn, peer := net.Pipe()
+	defer func() { _ = peer.Close() }()
+	conn := newConnWithOptions("extension", hostConn, connOptions{HeartbeatInterval: time.Hour})
+	conn.Start(t.Context())
+	host := NewHost(t.TempDir())
+	me := withConn(&managedExt{config: ExtConfig{Name: "extension"}, host: host}, conn)
+	host.exts["extension"] = me
+	handler := me.makeEventHandler("tool_call", 0)
+	loaded := extension.Extension{Name: "extension"}
+	loaded.AddEventHandler("tool_call", 0, handler)
+	runner := inproc.NewRunner([]extension.Extension{loaded}, t.TempDir())
+	conn.fail(&ExtensionUnresponsiveError{Extension: "extension", Operation: "outstanding request"})
+
+	if result, err := runner.EmitToolCall(t.Context(), extension.BashToolCallEvent{}); err != nil || result != nil {
+		t.Fatalf("tool-call dispatch after heartbeat failure = %v, %v; want nil, nil", result, err)
 	}
 }
 

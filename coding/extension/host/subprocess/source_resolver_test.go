@@ -172,6 +172,28 @@ func TestResolveExtConfigPacksNodeFactoryByDefault(t *testing.T) {
 	}
 }
 
+func TestResolveExtConfigNamesIndexEntrypointByDirectory(t *testing.T) {
+	root := t.TempDir()
+	entrypoint := filepath.Join(root, "claude-clone-hooks", "index.js")
+	writeResolverFile(t, entrypoint, "export default function extension(pi) {}\n")
+	config, _, err := ResolveExtConfig(entrypoint)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Name != "claude-clone-hooks" {
+		t.Fatalf("extension name = %q, want directory name", config.Name)
+	}
+	indexDirectory := filepath.Join(root, "index")
+	writeResolverFile(t, filepath.Join(indexDirectory, "index.js"), "export default function extension(pi) {}\n")
+	config, _, err = ResolveExtConfig(indexDirectory)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if config.Name != "index" {
+		t.Fatalf("directory extension name = %q, want index", config.Name)
+	}
+}
+
 func TestResolveExtConfigMapsExactExecutableToStandalone(t *testing.T) {
 	path := filepath.Join(t.TempDir(), "standalone")
 	writeResolverFile(t, path, "binary")

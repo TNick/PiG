@@ -26,12 +26,14 @@ type livenessTimer interface {
 }
 
 type livenessClock interface {
+	Now() time.Time
 	NewTimer(time.Duration) livenessTimer
 }
 
 type realLivenessClock struct{}
 type realLivenessTimer struct{ timer *time.Timer }
 
+func (realLivenessClock) Now() time.Time { return time.Now() }
 func (realLivenessClock) NewTimer(d time.Duration) livenessTimer {
 	return realLivenessTimer{timer: time.NewTimer(d)}
 }
@@ -54,31 +56,66 @@ type connOptions struct {
 	Clock             livenessClock
 	HeartbeatInterval time.Duration
 	HeartbeatTimeout  time.Duration
+	ExtensionPath     string
+	RegistrationOrder int
 }
 
 // ExtensionUnresponsiveError reports a missed dispatcher heartbeat.
 type ExtensionUnresponsiveError struct {
-	Extension string
-	RequestID string
-	Operation string
+	Extension         string
+	ExtensionPath     string
+	RegistrationOrder int
+	RequestID         string
+	Operation         string
+	OutstandingFor    time.Duration
+	OutstandingCount  int
 }
 
 func (e *ExtensionUnresponsiveError) Error() string {
+	var message string
 	if e.RequestID != "" {
-		return fmt.Sprintf("extension_unresponsive: extension %q did not answer heartbeat for request %q (%s)", e.Extension, e.RequestID, e.Operation)
+		message = fmt.Sprintf("extension_unresponsive: extension %q did not answer heartbeat for request %q (%s)", e.Extension, e.RequestID, e.Operation)
+	} else {
+		message = fmt.Sprintf("extension_unresponsive: extension %q did not answer heartbeat while %s", e.Extension, e.Operation)
 	}
-	return fmt.Sprintf("extension_unresponsive: extension %q did not answer heartbeat while %s", e.Extension, e.Operation)
+	if e.OutstandingCount > 0 || e.OutstandingFor > 0 {
+		message += fmt.Sprintf(", %d request(s) outstanding for %s", e.OutstandingCount, e.OutstandingFor)
+	}
+	if e.ExtensionPath != "" || e.RegistrationOrder > 0 {
+		message += " ["
+		if e.ExtensionPath != "" {
+			message += fmt.Sprintf("path=%q", e.ExtensionPath)
+		}
+		if e.RegistrationOrder > 0 {
+			if e.ExtensionPath != "" {
+				message += " "
+			}
+			message += fmt.Sprintf("registration_order=%d", e.RegistrationOrder)
+		}
+		message += "]"
+	}
+	return message
+}
+
+type pendingRequestInfo struct {
+	started   time.Time
+	operation string
 }
 
 // HandlerStalledError reports a request-inactivity lease expiration.
 type HandlerStalledError struct {
-	Extension        string
-	Operation        string
-	HeartbeatHealthy bool
+	Extension         string
+	ExtensionPath     string
+	RegistrationOrder int
+	RequestID         string
+	Operation         string
+	OutstandingCount  int
+	OutstandingFor    time.Duration
+	HeartbeatHealthy  bool
 }
 
 func (e *HandlerStalledError) Error() string {
-	return fmt.Sprintf("handler_stalled: extension %q %s made no request progress (heartbeat healthy: %t)", e.Extension, e.Operation, e.HeartbeatHealthy)
+	return fmt.Sprintf("handler_stalled: extension %q %s request %q stalled for %s with %d request(s) outstanding (heartbeat healthy: %t, path=%q, registration_order=%d)", e.Extension, e.Operation, e.RequestID, e.OutstandingFor, e.OutstandingCount, e.HeartbeatHealthy, e.ExtensionPath, e.RegistrationOrder)
 }
 
 // TransportError reports a concrete socket read or write failure.
@@ -106,11 +143,13 @@ type Conn struct {
 	// inbound observes each decoded frame on the read loop, in wire order, before routing. Cross-process reference accounting uses it so a later release on this connection can never overtake an earlier transmission.
 	inbound func(*Envelope)
 	// onClosed runs once when the read loop ends.
-	onClosed func()
-	name     string
-	conn     net.Conn
-	closing  atomic.Bool
-	closed   atomic.Bool
+	onClosed          func()
+	name              string
+	extensionPath     string
+	registrationOrder int
+	conn              net.Conn
+	closing           atomic.Bool
+	closed            atomic.Bool
 
 	// Outgoing message queue. Writer goroutine drains this. A frame that is
 	// queued or being written is outstanding work, so the heartbeat runs while
@@ -121,9 +160,10 @@ type Conn struct {
 
 	// Pending request tracking: maps request ID → response channel, and
 	// request ID → the sink for that request's tool_update notifications.
-	pendingMu sync.Mutex
-	pending   map[string]chan *Envelope
-	updates   map[string]func(json.RawMessage)
+	pendingMu   sync.Mutex
+	pending     map[string]chan *Envelope
+	pendingInfo map[string]pendingRequestInfo
+	updates     map[string]func(json.RawMessage)
 	// answered runs on the read loop when the response of a request routes to its waiter.
 	answered map[string]func()
 	// hostCalls counts, per request, the host calls the host applies for it.
@@ -216,9 +256,12 @@ func newConnWithOptions(name string, c net.Conn, options connOptions) *Conn {
 	}
 	return &Conn{
 		name:               name,
+		extensionPath:      options.ExtensionPath,
+		registrationOrder:  options.RegistrationOrder,
 		conn:               c,
 		outCh:              make(chan outboundFrame, 64),
 		pending:            make(map[string]chan *Envelope),
+		pendingInfo:        make(map[string]pendingRequestInfo),
 		updates:            make(map[string]func(json.RawMessage)),
 		answered:           make(map[string]func()),
 		hostCallCounts:     make(map[string]func(dialog bool, delta int)),
@@ -545,6 +588,7 @@ func (c *Conn) request(ctx context.Context, env *Envelope, inactivity time.Durat
 	respCh := make(chan *Envelope, 1)
 	c.pendingMu.Lock()
 	c.pending[env.ID] = respCh
+	c.pendingInfo[env.ID] = pendingRequestInfo{started: c.clock.Now(), operation: operation}
 	if fn := requestAnswered(ctx); fn != nil {
 		c.answered[env.ID] = fn
 	}
@@ -564,6 +608,7 @@ func (c *Conn) request(ctx context.Context, env *Envelope, inactivity time.Durat
 	defer func() {
 		c.pendingMu.Lock()
 		delete(c.pending, env.ID)
+		delete(c.pendingInfo, env.ID)
 		delete(c.answered, env.ID)
 		delete(c.hostCallCounts, env.ID)
 		delete(c.drainable, env.ID)
@@ -626,7 +671,7 @@ func (c *Conn) request(ctx context.Context, env *Envelope, inactivity time.Durat
 			if resp != nil && resp.Response != nil && resp.Response.Error != nil {
 				switch resp.Response.Error.Code {
 				case "extension_unresponsive":
-					return nil, &ExtensionUnresponsiveError{Extension: c.name, RequestID: env.ID, Operation: operation}
+					return nil, c.unresponsiveRequestError(env.ID)
 				case "extension_transport":
 					c.failureMu.Lock()
 					failure := c.failure
@@ -646,15 +691,21 @@ func (c *Conn) request(ctx context.Context, env *Envelope, inactivity time.Durat
 			case "completed":
 				invocation.Complete(ctx)
 			}
-			if inactivity > 0 && (state.State == "started" || state.State == "progress" || state.State == "blocked") {
-				inactivityTimer.Stop()
-				inactivityTimer = c.clock.NewTimer(inactivity)
-				inactivityC = inactivityTimer.C()
+			if inactivity > 0 {
+				switch state.State {
+				case "blocked", "suspended":
+					inactivityTimer.Stop()
+					inactivityC = nil
+				case "started", "progress", "completed":
+					inactivityTimer.Stop()
+					inactivityTimer = c.clock.NewTimer(inactivity)
+					inactivityC = inactivityTimer.C()
+				}
 			}
 		case <-inactivityC:
 			_ = c.Send(&Envelope{Type: MsgCancel, ID: env.ID, Cancel: &CancelPayload{RequestID: env.ID, Reason: "handler inactivity"}})
 			c.cancelHostCalls(env.ID)
-			return nil, &HandlerStalledError{Extension: c.name, Operation: operation, HeartbeatHealthy: !c.closed.Load()}
+			return nil, c.handlerStalledError(env.ID, operation)
 		case <-cancelled:
 			if c.beforeCancel != nil {
 				c.beforeCancel()
@@ -678,6 +729,49 @@ func (c *Conn) request(ctx context.Context, env *Envelope, inactivity time.Durat
 			return nil, ctx.Err()
 		}
 	}
+}
+
+func (c *Conn) unresponsiveRequestError(requestID string) *ExtensionUnresponsiveError {
+	c.pendingMu.Lock()
+	info, ok := c.pendingInfo[requestID]
+	count := len(c.pendingInfo)
+	c.pendingMu.Unlock()
+	failure := &ExtensionUnresponsiveError{
+		Extension:         c.name,
+		ExtensionPath:     c.extensionPath,
+		RegistrationOrder: c.registrationOrder,
+		RequestID:         requestID,
+		Operation:         info.operation,
+		OutstandingCount:  count,
+	}
+	if ok {
+		failure.OutstandingFor = max(0, c.clock.Now().Sub(info.started))
+	}
+	return failure
+}
+
+func (c *Conn) unresponsiveFailure() *ExtensionUnresponsiveError {
+	c.pendingMu.Lock()
+	defer c.pendingMu.Unlock()
+	failure := &ExtensionUnresponsiveError{
+		Extension:         c.name,
+		ExtensionPath:     c.extensionPath,
+		RegistrationOrder: c.registrationOrder,
+		Operation:         "outstanding work",
+		OutstandingCount:  len(c.pendingInfo),
+	}
+	var oldest pendingRequestInfo
+	for id, info := range c.pendingInfo {
+		if failure.RequestID == "" || info.started.Before(oldest.started) {
+			failure.RequestID = id
+			oldest = info
+		}
+	}
+	if failure.RequestID != "" {
+		failure.Operation = oldest.operation
+		failure.OutstandingFor = max(0, c.clock.Now().Sub(oldest.started))
+	}
+	return failure
 }
 
 // Incoming returns the channel of non-response messages from the extension.
@@ -1337,7 +1431,7 @@ heartbeat:
 					deadline = c.clock.NewTimer(c.heartbeatTimeout)
 					continue
 				}
-				c.fail(&ExtensionUnresponsiveError{Extension: c.name, Operation: "outstanding request"})
+				c.fail(c.unresponsiveFailure())
 				return
 			}
 		}
@@ -1548,4 +1642,24 @@ func applyRequestSuspension(ctx context.Context, state RequestStatePayload) {
 	if state.State == "suspended" {
 		fn(true)
 	}
+}
+
+func (c *Conn) handlerStalledError(requestID, operation string) *HandlerStalledError {
+	c.pendingMu.Lock()
+	info, ok := c.pendingInfo[requestID]
+	count := len(c.pendingInfo)
+	c.pendingMu.Unlock()
+	failure := &HandlerStalledError{
+		Extension:         c.name,
+		ExtensionPath:     c.extensionPath,
+		RegistrationOrder: c.registrationOrder,
+		RequestID:         requestID,
+		Operation:         operation,
+		OutstandingCount:  count,
+		HeartbeatHealthy:  !c.closed.Load(),
+	}
+	if ok {
+		failure.OutstandingFor = max(0, c.clock.Now().Sub(info.started))
+	}
+	return failure
 }
