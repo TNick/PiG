@@ -679,7 +679,10 @@ renewed by request-state progress. A handler that stops making progress is
 cancelled and quarantined; a healthy dispatcher alone does not renew this
 lease. A reported `blocked` or `suspended` state pauses the lease until the
 handler reports more progress or its caller cancels. This lets a busy handler
-fail independently of transport heartbeat.
+fail independently of transport heartbeat. Event dispatch drops work whose
+turn context is already cancelled; cancellation racing state synchronization or
+the request is treated as normal turn teardown, and the connection removes the
+request from its pending set.
 Renderer work has a five-second inactivity boundary off the TUI loop, retains
 the last completed frame, and disables only the stalled generation. A missed
 heartbeat closes the logical connection and fails pending work with a typed
