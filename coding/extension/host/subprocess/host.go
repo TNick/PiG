@@ -374,6 +374,9 @@ type Host struct {
 	// quarantinedCells records packed cells that crashed; PlanCells fissions a
 	// quarantined key back to isolated subprocesses.
 	quarantinedCells map[string]string
+	// pig additive (D103): retain the latest liveness failure until that
+	// extension registers again. Guarded by mu.
+	extensionFailures map[string]string
 	// packedCellSupervisors gives each packed cell key the same crash-loop
 	// circuit breaker (Supervisor, DefaultSupervisorConfig) every isolated
 	// extension and every packed member already has, so a Node (or Go/Rust/
@@ -641,6 +644,8 @@ func (me *managedExt) connection() *Conn { return me.conn.Load() }
 func (me *managedExt) setConnLocked(conn *Conn) {
 	if conn != nil && me.host != nil {
 		conn.beforeCancel = func() { _ = me.host.syncRunSignal(conn) }
+		// pig additive (D103): clear the old liveness failure after recovery.
+		delete(me.host.extensionFailures, me.config.Name)
 	}
 	me.conn.Store(conn)
 }
@@ -688,6 +693,7 @@ func NewHostWithConfigRoot(cwd, configRoot string) *Host {
 		loadOrder:             make(map[string]int),
 		builder:               NewBuilderWithConfigRoot(cacheDir, configRoot),
 		quarantinedCells:      make(map[string]string),
+		extensionFailures:     make(map[string]string),
 		packedCellSupervisors: make(map[string]*Supervisor),
 	}
 }
@@ -4315,6 +4321,14 @@ func (h *Host) disablePackedMember(me *managedExt, reason string) {
 }
 
 func (h *Host) handleUnresponsiveExtension(me *managedExt, failure *ExtensionUnresponsiveError) {
+	h.mu.Lock()
+	if h.extensionFailures == nil {
+		h.extensionFailures = make(map[string]string)
+	}
+	// pig additive (D103): retain the heartbeat failure for the native health
+	// command.
+	h.extensionFailures[failure.Extension] = failure.Error()
+	h.mu.Unlock()
 	slog.Error("extension missed heartbeat",
 		"extension", failure.Extension,
 		"path", failure.ExtensionPath,
@@ -4333,6 +4347,14 @@ func (h *Host) handleUnresponsiveExtension(me *managedExt, failure *ExtensionUnr
 }
 
 func (h *Host) handleStalledExtension(me *managedExt, failure *HandlerStalledError) {
+	h.mu.Lock()
+	if h.extensionFailures == nil {
+		h.extensionFailures = make(map[string]string)
+	}
+	// pig additive (D103): retain the stalled handler for the native health
+	// command.
+	h.extensionFailures[failure.Extension] = failure.Error()
+	h.mu.Unlock()
 	slog.Error("extension handler stalled",
 		"extension", failure.Extension,
 		"path", failure.ExtensionPath,

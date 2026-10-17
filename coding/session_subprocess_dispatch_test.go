@@ -4,6 +4,7 @@ import (
 	"context"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -75,5 +76,12 @@ func TestStalledSubprocessEventDoesNotBlockNativeBash(t *testing.T) {
 	}
 	if got := host.Extensions(); len(got) != 0 {
 		t.Fatalf("quarantined extension list = %d entries, want none", len(got))
+	}
+	health := host.HealthSnapshot()
+	if len(health.Extensions) != 1 || health.Extensions[0].Name != "hung" {
+		t.Fatalf("extension health = %+v, want the quarantined extension", health.Extensions)
+	}
+	if !strings.Contains(health.Extensions[0].LastFailure, "handler_stalled") {
+		t.Fatalf("extension health failure = %q, want the stall reason", health.Extensions[0].LastFailure)
 	}
 }
