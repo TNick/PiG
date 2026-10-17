@@ -799,6 +799,38 @@ func TestEventHandlerIgnoresHeartbeatFailure(t *testing.T) {
 	}
 }
 
+func TestEventHandlerRejectsCancelledTurnBeforeStateSync(t *testing.T) {
+	hostConn, peer := net.Pipe()
+	defer func() { _ = peer.Close() }()
+	conn := newConnWithOptions("cancelled-event", hostConn, connOptions{})
+	conn.Start(t.Context())
+	host := NewHost(t.TempDir())
+	host.SetUIBridge(NewUIBridge(nil))
+	me := withConn(&managedExt{config: ExtConfig{Name: "cancelled-event"}, host: host}, conn)
+	ctx, cancel := context.WithCancel(t.Context())
+	cancel()
+	if err := host.pushStateTo(ctx, me, conn); !errors.Is(err, context.Canceled) {
+		t.Fatalf("cancelled state sync error = %v, want context.Canceled", err)
+	}
+	if queued := len(conn.outCh); queued != 0 {
+		t.Fatalf("cancelled state sync queued %d frames", queued)
+	}
+
+	result, err := me.makeEventHandler("tool_call", 1)(
+		extension.BashToolCallEvent{}, ctx,
+	)
+	if err != nil || result != nil {
+		t.Fatalf("late event = %v, %v; want nil, nil", result, err)
+	}
+
+	conn.pendingMu.Lock()
+	pending := len(conn.pending)
+	conn.pendingMu.Unlock()
+	if pending != 0 {
+		t.Fatalf("late event left %d pending requests", pending)
+	}
+}
+
 // A saturated writer queue makes Send wait for the peer instead of dropping
 // the frame; once the peer reads, every frame arrives in order.
 func TestSaturatedWriterDeliversEveryFrame(t *testing.T) {

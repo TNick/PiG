@@ -1437,6 +1437,9 @@ func (h *Host) pushStateTo(ctx context.Context, me *managedExt, conn *Conn) erro
 	if h.uiBridge == nil || me == nil || conn == nil {
 		return nil
 	}
+	if err := ctx.Err(); err != nil {
+		return err
+	}
 	if err := h.syncRunSignal(conn); err != nil {
 		return err
 	}
@@ -3862,6 +3865,12 @@ func (me *managedExt) makeEventHandler(event string, handlerID int) extension.Ha
 				parent = dispatchContext
 			}
 		}
+		// A late event no longer owns an active turn. Reject it before state
+		// synchronization so cancellation cannot become an extension error or
+		// leave a request waiting on a runtime that has already moved on.
+		if event != "session_shutdown" && parent.Err() != nil {
+			return nil, nil
+		}
 		if event == "before_agent_start" {
 			var err error
 			argsJSON, err = promptOptionsEventArgs(parent, argsJSON)
@@ -3888,6 +3897,9 @@ func (me *managedExt) makeEventHandler(event string, handlerID int) extension.Ha
 			}, func() bool { return false })
 		}
 		if err := me.host.pushStateTo(parent, me, conn); err != nil {
+			if parent.Err() != nil {
+				return nil, nil
+			}
 			var unresponsive *ExtensionUnresponsiveError
 			if errors.As(err, &unresponsive) {
 				return nil, nil
@@ -3916,6 +3928,9 @@ func (me *managedExt) makeEventHandler(event string, handlerID int) extension.Ha
 			_ = request()
 		}
 		if err != nil {
+			if parent.Err() != nil {
+				return nil, nil
+			}
 			var unresponsive *ExtensionUnresponsiveError
 			if errors.As(err, &unresponsive) {
 				return nil, nil
