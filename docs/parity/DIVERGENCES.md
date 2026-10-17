@@ -697,9 +697,18 @@ and native tool work remains controlled by its caller. Heartbeat verifies that
 the SDK dispatcher and transport are responsive, while the event lease detects
 a handler that is busy without making request progress. Renderer generations
 remain bounded because rendering is latency-sensitive and the host can retain
-the last completed frame. A logical packed-member failure never quarantines
-healthy siblings. Shared process death
-remains the packed-cell recovery authority. Node recovery isolates an attributable culprit and restarts healthy members together. Unknown failure gets one whole-group restart, then diagnostic bisection on recurrence; identifying the failing member reunites the healthy group (D20). Neither tools nor callbacks interrupted by process death are replayed. Old-generation callbacks and UI frames retain their dead connection identity; only newly invoked named capabilities may use the recovered process. Recovery ends with the original owner or Host shutdown.
+the last completed frame. A logical packed-member failure with a healthy
+heartbeat never quarantines healthy siblings. A missed heartbeat means the
+shared dispatcher is unresponsive, so the host quarantines the whole packed
+cell and fails all members together. Shared process death remains the
+packed-cell recovery authority. Node recovery isolates an attributable culprit
+and restarts healthy members together. Unknown failure gets one whole-group
+restart, then diagnostic bisection on recurrence; identifying the failing
+member reunites the healthy group (D20). Neither tools nor callbacks
+interrupted by process death are replayed. Old-generation callbacks and UI
+frames retain their dead connection identity; only newly invoked named
+capabilities may use the recovered process. Recovery ends with the original
+owner or Host shutdown.
 
 The lifecycle handler owns a failed connection's diagnostic when a crash handler is installed. Commands, shortcuts and events interrupted by that connection still fail, but do not emit duplicate notifications. Without a crash handler, the runner reports the invocation error. Ordinary handler rejections are not transport failures. Packed socket-close and process-exit detectors claim each member under the same registry lock, so a late observation neither reports it twice nor unregisters a replacement. Subprocess stderr logs are removed after teardown unless a load or lifecycle diagnostic names them.
 

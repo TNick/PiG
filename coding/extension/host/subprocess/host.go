@@ -4310,6 +4310,10 @@ func (h *Host) handleUnresponsiveExtension(me *managedExt, failure *ExtensionUnr
 		"outstanding_count", failure.OutstandingCount,
 	)
 	reason := failure.Error()
+	if me.packedCellKey != "" {
+		h.quarantinePackedCell(me.packedCellKey, reason)
+		return
+	}
 	h.quarantineExtension(me, reason)
 }
 

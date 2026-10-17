@@ -736,18 +736,17 @@ func TestBlockedUserCommandWaitsWhileHeartbeatStaysHealthy(t *testing.T) {
 	}
 }
 
-func TestPackedMemberHeartbeatFailureDisablesOnlyLogicalMember(t *testing.T) {
-	clock := newManualLivenessClock()
+func TestPackedMemberHeartbeatFailureQuarantinesSharedCell(t *testing.T) {
 	hostA, peerA := net.Pipe()
 	defer func() { _ = peerA.Close() }()
 	hostB, peerB := net.Pipe()
 	defer func() { _ = peerB.Close() }()
-	connA := newConnWithOptions("member-a", hostA, connOptions{Clock: clock, HeartbeatInterval: 2 * time.Second, HeartbeatTimeout: time.Second})
-	connB := newConnWithOptions("member-b", hostB, connOptions{Clock: clock, HeartbeatInterval: time.Hour})
+	connA := newConnWithOptions("member-a", hostA, connOptions{})
+	connB := newConnWithOptions("member-b", hostB, connOptions{})
 	connA.Start(t.Context())
 	connB.Start(t.Context())
 	host := NewHost(t.TempDir())
-	disabled := make(chan string, 1)
+	disabled := make(chan string, 2)
 	host.SetCrashHandler(func(name string, _ time.Duration, isDisabled bool, _ string) {
 		if isDisabled {
 			disabled <- name
@@ -757,40 +756,27 @@ func TestPackedMemberHeartbeatFailureDisablesOnlyLogicalMember(t *testing.T) {
 	memberB := withConn(&managedExt{config: ExtConfig{Name: "member-b"}, host: host, packedCellKey: "cell-live"}, connB)
 	host.exts["member-a"] = memberA
 	host.exts["member-b"] = memberB
-	eventHandler := memberA.makeEventHandler("tool_call", 0)
-	go host.handleIncoming(memberA, memberA.connection())
-	result := startLivenessRequest(t, connA)
-	request := readLivenessEnvelope(t, peerA)
-	requestBody, err := json.Marshal(request)
-	if err != nil {
-		t.Fatal(err)
-	}
-	waitForWriteProgress(t, connA, uint64(4+len(requestBody)))
-	clock.advance(t, 2*time.Second)
-	if ping := readLivenessEnvelope(t, peerA); ping.Type != MsgPing {
-		t.Fatalf("heartbeat = %+v", ping)
-	}
-	clock.advance(t, time.Second)
-	var unresponsive *ExtensionUnresponsiveError
-	if err := <-result; !errors.As(err, &unresponsive) {
-		t.Fatalf("pending request error = %T %v", err, err)
-	}
-	select {
-	case name := <-disabled:
-		if name != "member-a" {
-			t.Fatalf("disabled member = %q", name)
+	failure := &ExtensionUnresponsiveError{Extension: "member-a", Operation: "outstanding request"}
+	host.handleUnresponsiveExtension(memberA, failure)
+	disabledNames := make(map[string]bool, 2)
+	for range 2 {
+		select {
+		case name := <-disabled:
+			disabledNames[name] = true
+		case <-t.Context().Done():
+			t.Fatal("heartbeat failure did not quarantine every packed member")
+		case <-time.After(3 * time.Second):
+			t.Fatal("heartbeat failure did not quarantine every packed member")
 		}
-	case <-t.Context().Done():
-		t.Fatal("heartbeat failure did not route through packed-member supervision")
 	}
-	if host.exts["member-a"] != nil || host.exts["member-b"] != memberB {
+	if !disabledNames["member-a"] || !disabledNames["member-b"] {
+		t.Fatalf("disabled packed members = %v, want both members", disabledNames)
+	}
+	if host.exts["member-a"] != nil || host.exts["member-b"] != nil {
 		t.Fatalf("packed registry after heartbeat failure = %#v", host.exts)
 	}
-	if connB.closed.Load() || host.QuarantinedCells()["cell-live"] != "" {
-		t.Fatal("logical heartbeat failure killed sibling or quarantined shared process")
-	}
-	if result, err := eventHandler(extension.BashToolCallEvent{}, t.Context()); err != nil || result != nil {
-		t.Fatalf("detached event handler = %v, %v; want nil, nil", result, err)
+	if !connB.closed.Load() || host.QuarantinedCells()["cell-live"] == "" {
+		t.Fatal("shared heartbeat failure did not quarantine and stop the packed cell")
 	}
 }
 
