@@ -672,9 +672,14 @@ Locked by: `internal/codingagent/debug_hotkey_release_test.go`
 ## D56 Subprocess liveness and renderer isolation
 
 What: Pig heartbeats a subprocess only while it owns outstanding work or live
-provider state. Tools, commands, events, and shortcuts have no host completion
-or inactivity timeout. Their caller-owned context remains authoritative, and a
-healthy dispatcher keeps the connection alive while awaited work continues.
+provider state. Native tool execution, commands, and shortcuts have no host
+completion or inactivity timeout; their caller-owned context remains
+authoritative. Extension event handlers have a 30-second inactivity lease,
+renewed by request-state progress. A handler that stops making progress is
+cancelled and quarantined; a healthy dispatcher alone does not renew this
+lease. A reported `blocked` or `suspended` state pauses the lease until the
+handler reports more progress or its caller cancels. This lets a busy handler
+fail independently of transport heartbeat.
 Renderer work has a five-second inactivity boundary off the TUI loop, retains
 the last completed frame, and disables only the stalled generation. A missed
 heartbeat closes the logical connection and fails pending work with a typed
@@ -686,11 +691,14 @@ request-inactivity state machine. Its only extension timeout is the opt-in,
 per-dialog `ExtensionUIDialogOptions.timeout` with a visible countdown.
 
 Why: wall-clock completion limits reject valid extension work and interactions
-that wait for a person or an external system. Heartbeat verifies that the SDK
-dispatcher and transport are responsive without imposing a duration limit on
-the operation. Renderer generations remain bounded because rendering is
-latency-sensitive and the host can retain the last completed frame. A logical
-packed-member failure never quarantines healthy siblings. Shared process death
+that wait for a person or an external system. The event lease is an inactivity
+boundary rather than a completion deadline: request-state progress renews it,
+and native tool work remains controlled by its caller. Heartbeat verifies that
+the SDK dispatcher and transport are responsive, while the event lease detects
+a handler that is busy without making request progress. Renderer generations
+remain bounded because rendering is latency-sensitive and the host can retain
+the last completed frame. A logical packed-member failure never quarantines
+healthy siblings. Shared process death
 remains the packed-cell recovery authority. Node recovery isolates an attributable culprit and restarts healthy members together. Unknown failure gets one whole-group restart, then diagnostic bisection on recurrence; identifying the failing member reunites the healthy group (D20). Neither tools nor callbacks interrupted by process death are replayed. Old-generation callbacks and UI frames retain their dead connection identity; only newly invoked named capabilities may use the recovered process. Recovery ends with the original owner or Host shutdown.
 
 The lifecycle handler owns a failed connection's diagnostic when a crash handler is installed. Commands, shortcuts and events interrupted by that connection still fail, but do not emit duplicate notifications. Without a crash handler, the runner reports the invocation error. Ordinary handler rejections are not transport failures. Packed socket-close and process-exit detectors claim each member under the same registry lock, so a late observation neither reports it twice nor unregisters a replacement. Subprocess stderr logs are removed after teardown unless a load or lifecycle diagnostic names them.
@@ -715,9 +723,9 @@ Locked by: `coding/extension/host/subprocess/liveness_test.go`,
 `coding/extension/host/subprocess/node_liveness_test.go`, Go/Rust/Python SDK
 liveness tests, and `coding/extension/host/subprocess/protocol_sdk_sync_test.go`.
 The tests use an injected monotonic clock and deterministic channels. They cover
-healthy and missing heartbeat, unbounded tool/command/event/shortcut waits,
-renderer retention, cancellation ordering, writer failure, and packed-member
-versus packed-process failure. `coding/extension/host/subprocess/crash_once_test.go` covers both detector orders, replacement, real crashing commands in packed/isolated mode, and ordinary errors. `isolated_log_test.go` covers normal runs, reload, cancellation and retained failure logs. `internal/codingagent/interactive_command_error_test.go` proves command and shortcut diagnostic ownership through the interactive dispatch path; `22-command-error-once` compares ordinary command rejection and recovery against Pi.
+healthy and missing heartbeat, unbounded tool/command/shortcut waits, event
+inactivity renewal, renderer retention, cancellation ordering, writer failure,
+and packed-member versus packed-process failure. `coding/extension/host/subprocess/crash_once_test.go` covers both detector orders, replacement, real crashing commands in packed/isolated mode, and ordinary errors. `isolated_log_test.go` covers normal runs, reload, cancellation and retained failure logs. `internal/codingagent/interactive_command_error_test.go` proves command and shortcut diagnostic ownership through the interactive dispatch path; `22-command-error-once` compares ordinary command rejection and recovery against Pi.
 Ratification: explicitly approved by the user for section SHA-256 `a4109be02ff4f48b03c168073e2288b032971cff63982741e7582b68464bca81`.
 SCRUTINIZED:approved
 ## D57 Installing an extension directory as a package is refused

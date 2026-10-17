@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log/slog"
 	"maps"
 	"net"
 	"os"
@@ -1308,8 +1309,16 @@ func (h *Host) sortExtensionsByLoadOrderLocked(extensions []extension.Extension)
 // recordLoadOrder ranks configs by their list position. A reload replaces the
 // ranking; a load appends names not yet ranked.
 func (h *Host) recordLoadOrder(configs []ExtConfig, replace bool) {
+	type registration struct {
+		name        string
+		path        string
+		packageName string
+		runtimeKind string
+		contentHash string
+		order       int
+	}
+	var registrations []registration
 	h.mu.Lock()
-	defer h.mu.Unlock()
 	if replace || h.loadOrder == nil {
 		h.loadOrder = make(map[string]int, len(configs))
 	}
@@ -1321,7 +1330,13 @@ func (h *Host) recordLoadOrder(configs []ExtConfig, replace bool) {
 	}
 	for _, config := range configs {
 		if _, ranked := h.loadOrder[config.Name]; !ranked {
-			h.loadOrder[config.Name] = len(h.loadOrder)
+			order := len(h.loadOrder)
+			h.loadOrder[config.Name] = order
+			registrations = append(registrations, registration{
+				name: config.Name, path: extConfigOrigin(config),
+				packageName: config.Package, runtimeKind: config.RuntimeKind,
+				contentHash: config.ContentHash, order: order + 1,
+			})
 		}
 		if config.SourceInfo != nil {
 			h.configSourceInfo[config.Name] = config.SourceInfo
@@ -1329,6 +1344,17 @@ func (h *Host) recordLoadOrder(configs []ExtConfig, replace bool) {
 		if config.selectedPath != "" {
 			h.configSelectedPath[config.Name] = config.selectedPath
 		}
+	}
+	h.mu.Unlock()
+	for _, item := range registrations {
+		slog.Info("extension registration order",
+			"extension", item.name,
+			"path", item.path,
+			"package", item.packageName,
+			"runtime_kind", item.runtimeKind,
+			"content_hash", item.contentHash,
+			"registration_order", item.order,
+		)
 	}
 }
 
@@ -2884,12 +2910,25 @@ func (h *Host) acceptExtConn(ctx context.Context, cancel context.CancelFunc, me 
 	return rawConn, nil
 }
 
+func (h *Host) newExtensionConn(me *managedExt, rawConn net.Conn) *Conn {
+	h.mu.Lock()
+	order, registered := h.loadOrder[me.config.Name]
+	h.mu.Unlock()
+	if registered {
+		order++
+	}
+	return newConnWithOptions(me.config.Name, rawConn, connOptions{
+		ExtensionPath:     extConfigOrigin(me.config),
+		RegistrationOrder: order,
+	})
+}
+
 // adoptConn runs the register/ready handshake over an established connection and
 // builds the extension.Extension. Shared by the subprocess and fused
 // in-process load paths.
 func (h *Host) adoptConn(ctx context.Context, me *managedExt, rawConn net.Conn, extCtx context.Context, cancel context.CancelFunc, isRestart bool) (*extension.Extension, error) {
 	// Wrap in managed connection.
-	conn := NewConn(me.config.Name, rawConn)
+	conn := h.newExtensionConn(me, rawConn)
 	h.observeXref(conn)
 	// Adopt before Start so this connection's own close finds it as me's current connection.
 	h.mu.Lock()
@@ -3396,6 +3435,11 @@ func (h *Host) buildExtension(me *managedExt, reg *RegisterPayload) *extension.E
 // pig divergence (D56): renderer inactivity and transport heartbeat are separate host policy.
 const rendererInactivity = 5 * time.Second
 
+// pig divergence (D56): event handlers without request progress are
+// quarantined after their inactivity lease; native tool execution stays
+// unbounded.
+const eventHandlerInactivity = 30 * time.Second
+
 // makeEntryRenderer returns an extension.EntryRenderer that renders a custom
 // session entry over the socket. Like makeMessageRenderer it hands back a lazy
 // proxy: the render loop never blocks and IPC happens off the TUI loop.
@@ -3786,8 +3830,20 @@ func (h *Host) handleEventSubscription(me *managedExt, call *CallPayload) (*Call
 // makeEventHandler returns a HandlerFn that dispatches events over the socket.
 func (me *managedExt) makeEventHandler(event string, handlerID int) extension.HandlerFn {
 	return func(args ...any) (any, error) {
+		me := me
+		if len(args) > 1 {
+			if dispatchContext, ok := args[1].(context.Context); ok && dispatchContext != nil {
+				me = me.current()
+			}
+		}
 		conn := me.connection()
 		if conn == nil {
+			me.host.mu.Lock()
+			active := me.host.exts[me.config.Name] == me
+			me.host.mu.Unlock()
+			if !active && me.replacement.Load() == nil {
+				return nil, nil
+			}
 			return nil, errors.New("extension not connected")
 		}
 
@@ -3832,13 +3888,17 @@ func (me *managedExt) makeEventHandler(event string, handlerID int) extension.Ha
 			}, func() bool { return false })
 		}
 		if err := me.host.pushStateTo(parent, me, conn); err != nil {
+			var unresponsive *ExtensionUnresponsiveError
+			if errors.As(err, &unresponsive) {
+				return nil, nil
+			}
 			return nil, me.dispatchError(fmt.Errorf("sync extension state for event %s: %w", event, me.host.invocationError(err)))
 		}
 
 		var resp *Envelope
 		var err error
 		request := func() error {
-			resp, err = conn.Request(parent, &Envelope{
+			resp, err = conn.requestWithInactivity(parent, &Envelope{
 				Type: MsgRequest,
 				Request: &RequestPayload{
 					Method:    "event",
@@ -3846,7 +3906,7 @@ func (me *managedExt) makeEventHandler(event string, handlerID int) extension.Ha
 					HandlerID: handlerID,
 					Args:      argsJSON,
 				},
-			})
+			}, eventHandlerInactivity, "event "+event)
 			return nil
 		}
 		if observation := ai.StreamObservationFromContext(parent); observation != nil {
@@ -3856,6 +3916,15 @@ func (me *managedExt) makeEventHandler(event string, handlerID int) extension.Ha
 			_ = request()
 		}
 		if err != nil {
+			var unresponsive *ExtensionUnresponsiveError
+			if errors.As(err, &unresponsive) {
+				return nil, nil
+			}
+			var stalled *HandlerStalledError
+			if errors.As(err, &stalled) {
+				me.host.handleStalledExtension(me, stalled)
+				return nil, nil
+			}
 			return nil, me.dispatchError(fmt.Errorf("event %s: %w", event, me.host.invocationError(err)))
 		}
 
@@ -4231,7 +4300,34 @@ func (h *Host) disablePackedMember(me *managedExt, reason string) {
 }
 
 func (h *Host) handleUnresponsiveExtension(me *managedExt, failure *ExtensionUnresponsiveError) {
+	slog.Error("extension missed heartbeat",
+		"extension", failure.Extension,
+		"path", failure.ExtensionPath,
+		"registration_order", failure.RegistrationOrder,
+		"request_id", failure.RequestID,
+		"operation", failure.Operation,
+		"elapsed", failure.OutstandingFor,
+		"outstanding_count", failure.OutstandingCount,
+	)
 	reason := failure.Error()
+	h.quarantineExtension(me, reason)
+}
+
+func (h *Host) handleStalledExtension(me *managedExt, failure *HandlerStalledError) {
+	slog.Error("extension handler stalled",
+		"extension", failure.Extension,
+		"path", failure.ExtensionPath,
+		"registration_order", failure.RegistrationOrder,
+		"request_id", failure.RequestID,
+		"operation", failure.Operation,
+		"elapsed", failure.OutstandingFor,
+		"outstanding_count", failure.OutstandingCount,
+		"heartbeat_healthy", failure.HeartbeatHealthy,
+	)
+	h.quarantineExtension(me, failure.Error())
+}
+
+func (h *Host) quarantineExtension(me *managedExt, reason string) {
 	if me.packedCellKey != "" {
 		h.disablePackedMember(me, reason)
 		return

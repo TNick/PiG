@@ -804,7 +804,7 @@ func (h *Host) acceptPackedExt(ctx context.Context, me *managedExt, ln net.Liste
 	}
 
 	h.markExtension(me.config.Name, "handshake-start")
-	conn := NewConn(me.config.Name, rawConn)
+	conn := h.newExtensionConn(me, rawConn)
 	if me.packedProcess.node {
 		conn.onDispatch = func() { me.packedProcess.lastOwner.Store(&me.config.Name) }
 	}

@@ -89,6 +89,15 @@ func extensionDefinitionName(definition extsource.Definition, input string) stri
 	if extension := filepath.Ext(name); extension != "" {
 		name = strings.TrimSuffix(name, extension)
 	}
+	if definition.Form == extsource.Factory && filepath.Ext(filepath.Base(input)) != "" {
+		switch strings.ToLower(name) {
+		case "index", "main", "extension":
+			parent := filepath.Base(filepath.Dir(filepath.Clean(input)))
+			if parent != "." && parent != string(filepath.Separator) {
+				name = parent
+			}
+		}
+	}
 	return name
 }
 
