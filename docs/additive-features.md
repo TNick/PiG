@@ -934,3 +934,34 @@ Remove when: Pi records these endings itself, or PiG can no longer lose a sessio
 
 Approval: the owner assigned lane idle-exit-165 on 2026-10-06 to make every exit that no user action asked for leave a record.
 SCRUTINIZED:approved
+
+---
+
+## D103 Native subprocess extension health report
+
+Stock disposition: product-neutral diagnostics. The command reports runtime
+state and selects no extension behavior.
+
+What: `/pig-extensions` reads a point-in-time snapshot from the native host.
+It lists extension identity, source path, registration order, connection
+state, outstanding requests and elapsed time, the most recent heartbeat or
+handler-stall failure, and quarantined packed cells. The command does not
+send a request to any extension process, so it remains usable while a cell is
+unresponsive.
+
+Why: a blocked extension must not hide which handler is stuck or prevent the
+operator from inspecting the host state.
+
+Call-site markers: `cmd/pig/extension_health.go`,
+`coding/extension/host/subprocess/health.go`.
+
+Locked by: `cmd/pig/extension_health_test.go` checks the command output and
+`coding/extension/host/subprocess/health_test.go` checks identity, pending
+request, failure, and quarantined-cell snapshots.
+
+Remove when: the extension host exposes an equivalent operator-readable
+status surface.
+
+Approval: requested in the harness failure report as a native status surface
+that remains available while an extension is stalled.
+SCRUTINIZED:approved

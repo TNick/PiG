@@ -397,13 +397,11 @@ func (b *cliRuntimeBuilder) buildResources(ctx context.Context, in cliBuildInput
 		owner := pigletToolOwner(func() []extension.Extension { return build.Extensions })
 		return append([]extension.Extension{piglet.BuildExtensionWithPigletTools(activePiglet, owner)}, builtins...)
 	}
-	if activePiglet != nil || len(builtInExtensions) > 0 {
-		build.ReloadBuiltinExtensions = func() []extension.Extension {
-			reloaded, _, _ := loadBuiltins()
-			return withPiglet(reloaded)
-		}
-		build.BuiltinExtensions = withPiglet(builtinExtensions)
+	build.ReloadBuiltinExtensions = func() []extension.Extension {
+		reloaded, _, _ := loadBuiltins()
+		return append(withPiglet(reloaded), extensionHealthExtension(build.Host))
 	}
+	build.BuiltinExtensions = append(withPiglet(builtinExtensions), extensionHealthExtension(build.Host))
 	build.Extensions = codingagent.ExtensionsInLoadOrder(build.SubprocessExtensions, build.BuiltinExtensions)
 	// Pi lists the services' registration failures before the extension load errors (main.ts:789-800).
 	build.ExtensionDiagnostics = slices.Concat(build.PreTrustExtensionDiagnostics, virtualModelDiagnostics, extensionLoadDiagnostics(extensionLoadErrs), extensionErrorDiagnostics(builtinErrs), extensionConflictDiagnostics(codingagent.DetectExtensionConflicts(build.Extensions)), extensionWarningDiagnostics(mergeExtensionWarnings(packageWarnings, replacementWarnings)))
